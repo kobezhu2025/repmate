@@ -76,6 +76,14 @@
     align-items:center;justify-content:center;text-align:center;padding:32px}
   #wx .t{font-size:19px;font-weight:600;margin-bottom:14px}
   #wx p{font-size:14px;color:var(--ink2);line-height:2}
+  #volBtn{right:70px}
+  #volPanel{position:absolute;top:calc(52px + env(safe-area-inset-top));right:14px;z-index:6;display:none;
+    background:rgba(20,24,28,.96);border:1px solid var(--line);border-radius:14px;padding:10px 14px;min-width:214px}
+  #volPanel.on{display:block}
+  .vr{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:7px 0}
+  .vr span{font-size:12px;color:var(--ink2)}
+  .vr b{min-width:46px;text-align:center;font-size:14px;font-variant-numeric:tabular-nums}
+  #volNote{font-size:10px;color:var(--ink2);margin-top:4px;line-height:1.6}
 </style>
 </head>
 <body>
@@ -119,6 +127,20 @@
 <div id="session">
   <div id="stage"><video id="vid" playsinline></video></div>
   <button class="quit" id="quitBtn">结束</button>
+  <button class="quit" id="volBtn">音量</button>
+  <div id="volPanel">
+    <div class="vr"><span>视频声音</span>
+      <div class="stepper">
+        <button data-vv="-10" aria-label="减少"></button><b id="vvVal">100%</b><button data-vv="10" class="plus" aria-label="增加"></button>
+      </div>
+    </div>
+    <div class="vr"><span>提示音</span>
+      <div class="stepper">
+        <button data-bv="-10" aria-label="减少"></button><b id="bvVal">70%</b><button data-bv="10" class="plus" aria-label="增加"></button>
+      </div>
+    </div>
+    <div id="volNote">调到 0% 即静音；视频声音调小后若无声，用手机侧边音量键补一点</div>
+  </div>
   <div id="pauseOvl"><span>已暂停 · 轻点继续</span></div>
   <div id="bigOvl"><div id="big">
     <div class="r" id="bigNum"></div>
@@ -308,14 +330,64 @@ $('exList').addEventListener('click',async ev=>{
 
 // ---------- 音频 ----------
 let AC=null;
-function initAudio(){try{if(!AC)AC=new (window.AudioContext||window.webkitAudioContext)()}catch(e){}}
-function beep(f,d,v){if(!AC)return;try{
-  const o=AC.createOscillator(),g=AC.createGain();
-  o.frequency.value=f;o.type='sine';g.gain.value=v||.25;
-  o.connect(g);g.connect(AC.destination);o.start();
-  g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+(d||.12));
-  o.stop(AC.currentTime+(d||.12));
-}catch(e){}}
+function initAudio(){
+  try{
+    if(!AC)AC=new (window.AudioContext||window.webkitAudioContext)();
+    if(AC&&AC.state==='suspended')AC.resume();
+  }catch(e){}
+}
+function beep(f,d,v){
+  if(!AC)return;
+  const lvl=(volBeep/100)*(v||.25);
+  if(lvl<=0.001)return;              // 提示音静音
+  try{
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.frequency.value=f;o.type='sine';g.gain.value=lvl;
+    o.connect(g);g.connect(AC.destination);o.start();
+    g.gain.exponentialRampToValueAtTime(.001,AC.currentTime+(d||.12));
+    o.stop(AC.currentTime+(d||.12));
+  }catch(e){}
+}
+
+// ---------- 音量 ----------
+let volVideo=100, volBeep=70;
+try{
+  const s=JSON.parse(localStorage.getItem('fc_vol')||'null');
+  if(s){if(typeof s.v==='number')volVideo=s.v;if(typeof s.b==='number')volBeep=s.b}
+}catch(e){}
+let vidGainNode=null, vidSrcDone=false;
+
+function saveVol(){try{localStorage.setItem('fc_vol',JSON.stringify({v:volVideo,b:volBeep}))}catch(e){}}
+function renderVol(){
+  $('vvVal').textContent=volVideo+'%';
+  $('bvVal').textContent=volBeep+'%';
+}
+// iOS 上 JS 改 video.volume 无效（系统限制），必须用 Web Audio 接管声道才能真正调小声。
+// 策略：100% 时不接管（走原生，音量键正常）；一旦低于 100% 才接管，接管失败则回退到原生 + 提示。
+function applyVideoVol(){
+  const v=$('vid');
+  const lvl=Math.max(0,Math.min(1,volVideo/100));
+  if(lvl>=1&&!vidSrcDone){
+    try{v.muted=false;v.volume=1}catch(e){}
+    return true;
+  }
+  if(!AC){initAudio()}
+  if(!AC){try{v.muted=(lvl<=0);v.volume=lvl}catch(e){};return false}
+  if(!vidSrcDone){
+    try{
+      const src=AC.createMediaElementSource(v);
+      vidGainNode=AC.createGain();
+      src.connect(vidGainNode);vidGainNode.connect(AC.destination);
+      vidSrcDone=true;
+    }catch(e){
+      try{v.muted=(lvl<=0);v.volume=lvl}catch(x){}
+      return false;                  // 接管失败（少见），只能靠系统音量键
+    }
+  }
+  if(vidGainNode)vidGainNode.gain.value=lvl;
+  try{v.muted=(lvl<=0);v.volume=1}catch(e){}   // 音量交给 gain，避免双重衰减
+  return true;
+}
 
 // ---------- 会话 ----------
 let S={idx:0,set:1,phase:'idle'};
@@ -351,6 +423,7 @@ function loadExercise(){
 }
 function beginSet(){
   S.phase='work';setStart=Date.now();
+  initAudio();                 // 保证 AudioContext 处于 running（接管后音量的前提）
   $('pauseOvl').style.display='none';
   const e=cur();
   $('bigNum').textContent=`第 ${S.set} 组`;
@@ -360,7 +433,7 @@ function beginSet(){
   if(e.url){
     try{$('vid').currentTime=0}catch(x){}
     $('vid').onended=finishSet;
-    $('vid').muted=false;
+    applyVideoVol();
     const p=$('vid').play();
     if(p&&p.catch)p.catch(()=>{$('vid').muted=true;const q=$('vid').play();if(q&&q.catch)q.catch(()=>{})});
   }else{
@@ -393,9 +466,37 @@ function finishSet(){
 $('doneBtn').addEventListener('click',finishSet);
 $('quitBtn').addEventListener('click',()=>endSession(true));
 
+// 音量面板
+$('volBtn').addEventListener('click',ev=>{
+  ev.stopPropagation();
+  $('volPanel').classList.toggle('on');
+});
+$('volPanel').addEventListener('click',ev=>{
+  ev.stopPropagation();
+  const b=ev.target.closest('button');if(!b)return;
+  if(b.dataset.vv!==undefined){
+    volVideo=Math.max(0,Math.min(100,volVideo+parseInt(b.dataset.vv,10)));
+    renderVol();saveVol();
+    const ok=applyVideoVol();
+    if(!ok&&volVideo<100)showVolWarn();
+  }else if(b.dataset.bv!==undefined){
+    volBeep=Math.max(0,Math.min(100,volBeep+parseInt(b.dataset.bv,10)));
+    renderVol();saveVol();
+    beep(880,.12,.35);           // 立刻试听当前提示音大小
+  }
+});
+let volWarned=false;
+function showVolWarn(){
+  if(volWarned)return;volWarned=true;
+  const n=$('volNote');
+  if(n)n.textContent='这台设备不支持网页内调音量，请用手机侧边音量键';
+}
+
 // 轻点视频空白区域：暂停 / 继续
 $('session').addEventListener('click',ev=>{
   if(ev.target.closest('button'))return;   // 按钮照常
+  if(ev.target.closest('#volPanel'))return;
+  $('volPanel').classList.remove('on');
   if(S.phase!=='work')return;
   const v=$('vid');
   if(!cur()||!cur().url||!v.src)return;
@@ -472,6 +573,7 @@ function goHome(){
 }
 $('homeBtn').addEventListener('click',goHome);
 
+renderVol();
 loadAll();
 </script>
 </body>
