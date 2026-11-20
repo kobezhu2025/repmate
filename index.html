@@ -490,7 +490,7 @@ function applyVideoVol(){
 }
 
 // ---------- 会话 ----------
-let S={idx:0,set:1,phase:'idle'};
+let S={idx:0,set:1,phase:'idle',resumeT:0};
 let results=[],restTimer=null,restLeft=0,restTotal=0,setStart=0;
 let wakeLock=null,manualTimer=null,pendingAfter=null;
 
@@ -506,10 +506,11 @@ function startSession(resume){
   results=exercises.map(e=>({name:e.name,secs:[]}));
   S={idx:0,set:1,phase:'idle'};
   if(resume){
-    // 断点续练：恢复到上次中断的动作/组，已完成的组数记录一并带回
+    // 断点续练：恢复到上次中断的动作/组/视频秒数，已完成的组数记录一并带回
     const i=Math.min(resume.idx,exercises.length-1);
     if(resume.results)results.forEach((r,j)=>{if(resume.results[j]&&resume.results[j].secs)r.secs=resume.results[j].secs.slice()});
     S.idx=i;S.set=Math.min(Math.max(1,resume.set),exercises[i].sets);
+    S.resumeT=(typeof resume.t==='number'&&resume.t>0)?resume.t:0;
   }else{
     clearProgress();
   }
@@ -520,14 +521,10 @@ function loadExercise(){
   const e=cur();
   if(e.url){
     $('vid').src=e.url;$('vid').style.display='block';
-    // 竖版视频铺满全屏（cover）；横版视频保持完整（contain），避免左右被裁太多
-    $('vid').onloadedmetadata=()=>{
-      const r=$('vid').videoWidth/$('vid').videoHeight;
-      $('vid').style.objectFit=(r&&r>1)?'contain':'cover';
-    };
   }
   else{$('vid').removeAttribute('src');$('vid').style.display='none'}
   saveProgress();
+  scheduleSave();
   beginSet();
 }
 function beginSet(){
@@ -541,6 +538,15 @@ function beginSet(){
   clearInterval(manualTimer);
   if(e.url){
     try{$('vid').currentTime=0}catch(x){}
+    // 元数据加载后：设定适配方式 + 续练 seek 到上次秒数
+    $('vid').onloadedmetadata=()=>{
+      const r=$('vid').videoWidth/$('vid').videoHeight;
+      $('vid').style.objectFit=(r&&r>1)?'contain':'cover';
+      if(S.resumeT>0){
+        try{$('vid').currentTime=S.resumeT}catch(x){}
+        S.resumeT=0;
+      }
+    };
     $('vid').onended=finishSet;
     applyVideoVol();
     const p=$('vid').play();
@@ -564,7 +570,7 @@ function finishSet(){
   beep(740,.15,.3);
   const lastSet=wasSet>=cur().sets;
   const lastEx=S.idx>=exercises.length-1;
-  if(lastSet&&lastEx){endSession();return}
+  if(lastSet&&lastEx){endSession(true,true);return}
   if(lastSet){
     startRest(()=>{S.idx++;S.set=1;loadExercise()},
       `下一个动作：<b>${esc(exercises[S.idx+1].name)}</b>`);
@@ -616,16 +622,26 @@ $('session').addEventListener('click',ev=>{
   }else{
     v.pause();
     $('pauseOvl').style.display='flex';
+    saveProgress();           // 暂停立即落盘，退出可续到当前秒数
   }
 });
 
 // ---------- 断点续练 ----------
+let saveTimer=null;
 function saveProgress(){
   if(S.phase==='idle'||!results.length)return;
+  // 记录视频播放到的秒数（精确续播）
+  let t=0;
+  try{t=Math.floor($('vid').currentTime||0)}catch(e){}
   try{localStorage.setItem('fc_session',JSON.stringify({
-    idx:S.idx,set:S.set,results:results.map(r=>({secs:r.secs.slice()})),ts:Date.now()}))}catch(e){}
+    idx:S.idx,set:S.set,t:t,results:results.map(r=>({secs:r.secs.slice()})),ts:Date.now()}))}catch(e){}
 }
-function clearProgress(){try{localStorage.removeItem('fc_session')}catch(e){}}
+// 训练中每秒 + 暂停时实时落盘，保证任何时刻退出都能续
+function scheduleSave(){
+  clearInterval(saveTimer);
+  saveTimer=setInterval(saveProgress,1000);
+}
+function clearProgress(){clearInterval(saveTimer);try{localStorage.removeItem('fc_session')}catch(e){}}
 function checkResume(){
   let sv=null;
   try{sv=JSON.parse(localStorage.getItem('fc_session')||'null')}catch(e){}
@@ -634,7 +650,8 @@ function checkResume(){
   if(sv.idx>=exercises.length){clearProgress();return}
   const bar=$('resumeBar');
   const e=exercises[sv.idx];
-  $('resumeTxt').innerHTML=`上次练到：<b>${esc(e.name)}</b> 第 ${Math.min(sv.set,e.sets)} 组（共 ${totalSets()} 组）`;
+  const ts=(typeof sv.t==='number'&&sv.t>0)?(' · '+fmt(sv.t)):'';
+  $('resumeTxt').innerHTML=`上次练到：<b>${esc(e.name)}</b> 第 ${Math.min(sv.set,e.sets)} 组${ts}`;
   bar.style.display='flex';
 }
 $('resumeGo').addEventListener('click',()=>{
@@ -681,16 +698,21 @@ $('skipR').addEventListener('click',()=>{
   const fn=pendingAfter;pendingAfter=null;if(fn)fn();
 });
 
-function endSession(allowEmpty){
+function endSession(allowEmpty,natural){
   const didAny=results&&results.some(r=>r.secs.length);
   if(!didAny&&!allowEmpty){return}
   S.phase='idle';
-  clearInterval(restTimer);clearInterval(manualTimer);
-  clearProgress();
+  clearInterval(restTimer);clearInterval(manualTimer);clearInterval(saveTimer);
   $('rest').style.display='none';
   try{$('vid').pause()}catch(e){}
   try{if(wakeLock)wakeLock.release()}catch(e){}
-  if(!didAny){goHome();return}
+  // 手动中途退出（点"结束"）：保留进度，回首页可续练
+  if(!natural){
+    saveProgress();
+    goHome();return;
+  }
+  // 自然完成全部：清进度，出总结
+  clearProgress();
   $('session').style.display='none';$('summary').style.display='block';
   let html='',n=0;
   results.forEach((r,i)=>{
@@ -704,11 +726,12 @@ function endSession(allowEmpty){
   $('sumList').innerHTML=html;
 }
 function goHome(){
-  clearInterval(restTimer);clearInterval(manualTimer);
+  clearInterval(restTimer);clearInterval(manualTimer);clearInterval(saveTimer);
   $('rest').style.display='none';
   $('session').style.display='none';$('summary').style.display='none';
   $('setup').style.display='block';
   S.phase='idle';
+  checkResume();   // 回首页后如有进度，显示续练条
 }
 $('homeBtn').addEventListener('click',goHome);
 
