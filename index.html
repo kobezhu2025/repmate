@@ -84,12 +84,22 @@
   .vr span{font-size:12px;color:var(--ink2)}
   .vr b{min-width:46px;text-align:center;font-size:14px;font-variant-numeric:tabular-nums}
   #volNote{font-size:10px;color:var(--ink2);margin-top:4px;line-height:1.6}
+  #resumeBar{display:none;align-items:center;justify-content:space-between;gap:10px;background:var(--card);
+    border:1px solid var(--green);border-radius:12px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.5}
+  #resumeBar .rbtn{display:flex;gap:6px;flex:none}
 </style>
 </head>
 <body>
 
 <!-- 配置页 -->
 <div id="setup">
+  <div id="resumeBar">
+    <span id="resumeTxt"></span>
+    <span class="rbtn">
+      <button class="mini" id="resumeGo">继续训练</button>
+      <button class="mini gray" id="resumeDrop">丢弃</button>
+    </span>
+  </div>
   <h1>跟练计数器</h1>
   <p class="sub">每个动作一段短视频（可选）。设好组数和组间休息，开始后全程免操作：播完一遍视频 = 一组，自动休息，自动下一组。</p>
   <div class="card">
@@ -121,6 +131,9 @@
   <button class="btn sub2" id="applyAll" style="margin-bottom:10px">把默认组数和休息统一应用到全部动作</button>
   <button class="btn" id="startBtn">开始跟练 →</button>
   <button class="btn sub2" id="clearBtn" style="margin-top:8px">清空全部</button>
+  <div id="fsaRow" style="margin-top:8px">
+    <button class="mini gray" id="fsaBtn" style="width:100%;justify-content:center">🔗 记住视频文件位置（下次自动加载）</button>
+  </div>
 </div>
 
 <!-- 跟练页：全屏视频 + 浮层 -->
@@ -182,7 +195,7 @@ if(/MicroMessenger/i.test(navigator.userAgent)){
 
 // ---------- 数据 ----------
 let exercises=[];        // {name, sets, rest, blob, url}
-let restDefault=60, defaultSets=3, pendingVideo=null;
+let restDefault=60, defaultSets=3, pendingVideo=null, pendingReplace=-1;
 
 function idb(){return new Promise((res,rej)=>{const r=indexedDB.open('fitcount',2);
   r.onupgradeneeded=()=>{try{r.result.createObjectStore('vids')}catch(e){}};
@@ -243,6 +256,15 @@ $('applyAll').addEventListener('click',()=>{
 $('exVideo').addEventListener('change',e=>{
   const f=e.target.files&&e.target.files[0];
   if(!f)return;
+  if(pendingReplace>=0){          // 给已有动作补选/更换视频
+    const ex=exercises[pendingReplace];
+    ex.blob=f;ex.url=URL.createObjectURL(f);
+    vidRes(f).then(r=>{ex.res=r;saveMeta();renderList()});
+    idbSet(ex.name,f);
+    pendingReplace=-1;
+    e.target.value='';
+    return;
+  }
   pendingVideo=f;
   const p=$('pending');
   p.style.display='block';
@@ -278,6 +300,79 @@ $('startBtn').addEventListener('click',()=>{
   startSession();
 });
 
+// ---------- 记住视频文件位置（File System Access API，Chrome/Edge 支持） ----------
+// 思路：让用户"一次授权整个文件夹"或"逐个文件授权"，浏览器记住句柄；
+// 下次打开时点一下"恢复授权"，就能从磁盘原文件重新挂上视频，不用再逐个找文件。
+// 说明：网页永远读不到真实绝对路径，但句柄能在授权后持久指向同一个文件。
+const FSA_SUPPORTED = ('showOpenFilePicker' in window) || ('showDirectoryPicker' in window);
+
+// 存句柄到 IndexedDB（句柄可结构化克隆）
+async function idbSetHandle(k,h){try{const db=await idb();await new Promise((res,rej)=>{
+  const t=db.transaction('vids','readwrite');t.objectStore('vids').put(h,k);
+  t.oncomplete=res;t.onerror=()=>rej(t.error)})}catch(e){}}
+async function idbGetHandle(k){try{const db=await idb();return await new Promise(res=>{
+  const t=db.transaction('vids','readonly');const r=t.objectStore('vids').get(k);
+  r.onsuccess=()=>res(r.result||null);r.onerror=()=>res(null)})}catch(e){return null}}
+
+async function fileFromHandle(h){
+  const p=await h.getFile();
+  return new File([p], h.name, {type:p.type});
+}
+
+// 保存当前所有视频的句柄（通过 picker 获得）
+async function saveHandles(){
+  if(!FSA_SUPPORTED)return;
+  const dir=await window.showDirectoryPicker({mode:'read'}).catch(()=>null);
+  if(!dir)return;
+  let ok=0;
+  for(const ex of exercises){
+    if(!ex.name)continue;
+    // 尝试在授权目录里按"动作名.扩展名"找对应视频
+    // 用户可能命名不一致，这里仅尝试常见扩展名
+    for(const ext of ['mp4','mov','webm','m4v']){
+      try{
+        const h=await dir.getFileHandle(ex.name+'.'+ext);
+        await idbSetHandle('fh_'+ex.name,h);
+        ok++;break;
+      }catch(e){}
+    }
+  }
+  return ok;
+}
+
+// 恢复：读句柄 → 请求权限 → 挂回 video
+async function restoreHandles(){
+  if(!FSA_SUPPORTED)return 0;
+  let ok=0;
+  for(const ex of exercises){
+    if(ex.url)continue;   // 已有视频的不动
+    const h=await idbGetHandle('fh_'+ex.name);
+    if(!h)continue;
+    try{
+      let perm=await h.queryPermission({mode:'read'});
+      if(perm!=='granted')perm=await h.requestPermission({mode:'read'});
+      if(perm!=='granted')continue;
+      const f=await fileFromHandle(h);
+      ex.blob=f;ex.url=URL.createObjectURL(f);
+      const r=await vidRes(f);ex.res=r;
+      await idbSet(ex.name,f);   // 同时写回本地缓存，之后就算句柄失效也有缓存
+      ok++;
+    }catch(e){}
+  }
+  if(ok){saveMeta();renderList();}
+  return ok;
+}
+
+$('fsaBtn').addEventListener('click',async()=>{
+  if(!FSA_SUPPORTED){showErr('当前浏览器不支持记住文件位置，请改用 Chrome 或 Edge');return}
+  if(!exercises.length){showErr('先添加动作再记住位置');return}
+  const n=await saveHandles();
+  if(n===undefined){showErr('');return}   // 用户取消选择目录
+  showErr(n?('已记住 '+n+' 个视频的位置，下次打开点"恢复"即可自动加载'):'未匹配到视频：请把视频文件名改成与动作名一致（如 动作1.mp4）后重试');
+});
+
+// 页面加载时尝试自动恢复（若浏览器已记住权限则静默恢复）
+
 function renderList(){
   const list=$('exList');
   list.innerHTML='';
@@ -290,6 +385,7 @@ function renderList(){
     const d=document.createElement('div');d.className='ex';
     d.innerHTML=`<span class="no">${i+1}</span>
       <div class="n"><b>${esc(e.name)}</b><span>${e.url?('有视频'+(e.res?' · 原画 '+e.res:'')):'无视频·手动完成'}</span></div>
+      ${e.url?'':`<button class="mini" data-v="${i}">补视频</button>`}
       <span class="no">组数</span>
       <div class="stepper">
         <button data-s="-1" data-i="${i}" aria-label="减少"></button><b>${e.sets}</b><button data-s="1" data-i="${i}" class="plus" aria-label="增加"></button>
@@ -325,6 +421,10 @@ $('exList').addEventListener('click',async ev=>{
     await idbDel(exercises[i].name);
     exercises.splice(i,1);
     saveMeta();renderList();
+  }else if(b.dataset.v!==undefined){
+    pendingReplace=parseInt(b.dataset.v,10);
+    showErr('');
+    $('exVideo').click();
   }
 });
 
@@ -399,12 +499,20 @@ function totalSets(){return exercises.reduce((a,e)=>a+e.sets,0)}
 function doneSets(){let n=0;for(let i=0;i<S.idx;i++)n+=exercises[i].sets;return n+S.set-1}
 function fmt(s){const m=Math.floor(s/60),ss=s%60;return m>0?`${m}分${String(ss).padStart(2,'0')}秒`:`${ss}秒`}
 
-function startSession(){
+function startSession(resume){
   initAudio();
   $('setup').style.display='none';$('summary').style.display='none';
   $('session').style.display='block';
   results=exercises.map(e=>({name:e.name,secs:[]}));
   S={idx:0,set:1,phase:'idle'};
+  if(resume){
+    // 断点续练：恢复到上次中断的动作/组，已完成的组数记录一并带回
+    const i=Math.min(resume.idx,exercises.length-1);
+    if(resume.results)results.forEach((r,j)=>{if(resume.results[j]&&resume.results[j].secs)r.secs=resume.results[j].secs.slice()});
+    S.idx=i;S.set=Math.min(Math.max(1,resume.set),exercises[i].sets);
+  }else{
+    clearProgress();
+  }
   if(navigator.wakeLock){navigator.wakeLock.request('screen').then(w=>{wakeLock=w}).catch(()=>{})}
   loadExercise();
 }
@@ -419,6 +527,7 @@ function loadExercise(){
     };
   }
   else{$('vid').removeAttribute('src');$('vid').style.display='none'}
+  saveProgress();
   beginSet();
 }
 function beginSet(){
@@ -451,6 +560,7 @@ function finishSet(){
   const secs=Math.max(1,Math.round((Date.now()-setStart)/1000));
   results[S.idx].secs.push(secs);
   const wasSet=S.set;S.set++;
+  saveProgress();
   beep(740,.15,.3);
   const lastSet=wasSet>=cur().sets;
   const lastEx=S.idx>=exercises.length-1;
@@ -509,6 +619,34 @@ $('session').addEventListener('click',ev=>{
   }
 });
 
+// ---------- 断点续练 ----------
+function saveProgress(){
+  if(S.phase==='idle'||!results.length)return;
+  try{localStorage.setItem('fc_session',JSON.stringify({
+    idx:S.idx,set:S.set,results:results.map(r=>({secs:r.secs.slice()})),ts:Date.now()}))}catch(e){}
+}
+function clearProgress(){try{localStorage.removeItem('fc_session')}catch(e){}}
+function checkResume(){
+  let sv=null;
+  try{sv=JSON.parse(localStorage.getItem('fc_session')||'null')}catch(e){}
+  if(!sv||!exercises.length){return}
+  // 动作配置对得上才允许恢复（名字序列一致）
+  if(sv.idx>=exercises.length){clearProgress();return}
+  const bar=$('resumeBar');
+  const e=exercises[sv.idx];
+  $('resumeTxt').innerHTML=`上次练到：<b>${esc(e.name)}</b> 第 ${Math.min(sv.set,e.sets)} 组（共 ${totalSets()} 组）`;
+  bar.style.display='flex';
+}
+$('resumeGo').addEventListener('click',()=>{
+  let sv=null;
+  try{sv=JSON.parse(localStorage.getItem('fc_session')||'null')}catch(e){}
+  $('resumeBar').style.display='none';
+  if(sv&&exercises.length)startSession(sv);
+});
+$('resumeDrop').addEventListener('click',()=>{
+  clearProgress();$('resumeBar').style.display='none';
+});
+
 function startRest(after,label){
   pendingAfter=after;
   restLeft=cur().rest;restTotal=restLeft;
@@ -548,6 +686,7 @@ function endSession(allowEmpty){
   if(!didAny&&!allowEmpty){return}
   S.phase='idle';
   clearInterval(restTimer);clearInterval(manualTimer);
+  clearProgress();
   $('rest').style.display='none';
   try{$('vid').pause()}catch(e){}
   try{if(wakeLock)wakeLock.release()}catch(e){}
@@ -574,7 +713,12 @@ function goHome(){
 $('homeBtn').addEventListener('click',goHome);
 
 renderVol();
-loadAll();
+// 手机浏览器（无 FSA）不显示"记住文件位置"按钮
+if(!FSA_SUPPORTED){const r=$('fsaRow');if(r)r.style.display='none'}
+loadAll().then(()=>{
+  checkResume();
+  if(FSA_SUPPORTED)restoreHandles();
+});
 </script>
 </body>
 </html>
